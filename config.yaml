@@ -1,0 +1,45 @@
+rpc:
+  ipc_path: "/var/lib/reth/reth.ipc"
+  ws_url: "ws://localhost:8546"
+  chain_id: 1
+
+redis:
+  addr: "localhost:6379"
+  db: 0
+  # bump this if state updates start lagging
+  pool_size: 20
+
+clickhouse:
+  dsn: "clickhouse://localhost:9000/hft"
+
+zmq:
+  state_pub: "tcp://*:5555"
+  alert_pub: "tcp://*:5556"
+  arb_pub:   "tcp://*:5557"
+
+protocols:
+  aave_v3:
+    pool:            "0x87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2"
+    oracle:          "0x54586bE62E3c3580375aE3723C145253060Ca0C2"
+    data_provider:   "0x7B4EB56E7CD4b454BA8ff71E4518426369a138a3"
+    emode_enabled:   true
+  morpho_blue:
+    hub:             "0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb"
+  spark:
+    pool:            "0xC13e21B648A5Ee794902342038FF3aDAB66BE987"
+
+cex:
+  binance_ws:  "wss://stream.binance.com:9443"
+  bybit_ws:    "wss://stream.bybit.com/v5/public"
+  okx_ws:      "wss://ws.okx.com:8443/ws/v5/public"
+
+thresholds:
+  hf_warn:           1.2
+  hf_critical:       1.05
+  cascade_threshold: 0.025   # 2.5% price drop triggers cascade check
+  arb_min_spread:    0.04    # 4% net APY floor for carry trades
+  slippage_buckets:  [1_000_000, 5_000_000, 10_000_000]
+
+logging:
+  level: "info"
+  format: "json"
