@@ -7,107 +7,135 @@ import (
 	"math"
 	"os"
 	"os/signal"
-	"sort"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
 
+	"github.com/google/btree"
 	"github.com/gorilla/websocket"
 	"go.uber.org/zap"
 )
 
-// Level is a single price level in an order book.
-type Level struct {
-	Price float64
-	Size  float64
+// priceTick is the btree item. floats as keys are fine here — we control
+// the precision coming from the exchange (they send strings, we parse once).
+type priceTick struct {
+	price float64
+	qty   float64
 }
 
-// Book is a local L2 order book. Lock it before touching bids/asks.
+func (a priceTick) Less(b btree.Item) bool {
+	return a.price < b.(*priceTick).price
+}
+
+// sideBook is one side of the order book backed by a B-Tree.
+// Writes are O(log n), reads sweep O(k) — no sort on the hot path.
+type sideBook struct {
+	mu   sync.RWMutex
+	tree *btree.BTreeG[*priceTick]
+	asc  bool // true = asks (price asc), false = bids (price desc)
+}
+
+func newSideBook(asc bool) *sideBook {
+	cmp := func(a, b *priceTick) bool {
+		if asc {
+			return a.price < b.price
+		}
+		return a.price > b.price
+	}
+	return &sideBook{tree: btree.NewG(32, cmp), asc: asc}
+}
+
+func (s *sideBook) update(price, qty float64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if qty == 0 {
+		s.tree.Delete(&priceTick{price: price})
+		return
+	}
+	// ReplaceOrInsert handles both new levels and qty updates
+	s.tree.ReplaceOrInsert(&priceTick{price: price, qty: qty})
+}
+
+// sweep walks the book from best price and returns (avgFill, slippage).
+// Called under RLock — no allocation beyond the loop stack.
+func (s *sideBook) sweep(notionalUSD float64) (avgPrice, slippage float64) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if s.tree.Len() == 0 {
+		return 0, 1.0
+	}
+
+	var topPrice float64
+	first := true
+	remaining := notionalUSD
+	totalQty := 0.0
+	totalCost := 0.0
+
+	s.tree.Ascend(func(tick *priceTick) bool {
+		if first {
+			topPrice = tick.price
+			first = false
+		}
+		fillQty := math.Min(remaining/tick.price, tick.qty)
+		totalQty += fillQty
+		totalCost += fillQty * tick.price
+		remaining -= fillQty * tick.price
+		return remaining > 0
+	})
+
+	if totalQty == 0 {
+		return 0, 1.0
+	}
+	avgPrice = totalCost / totalQty
+	if s.asc {
+		slippage = (avgPrice - topPrice) / topPrice
+	} else {
+		slippage = (topPrice - avgPrice) / topPrice
+	}
+	return avgPrice, slippage
+}
+
+// Book holds one venue's L2 order book. Bids and asks are independent B-Trees
+// so writes on one side don't block reads on the other.
 type Book struct {
-	mu       sync.RWMutex
-	Exchange string
-	Symbol   string
-	Bids     map[float64]float64 // price -> qty
-	Asks     map[float64]float64
-	UpdatedAt time.Time
+	Exchange  string
+	Symbol    string
+	bids      *sideBook
+	asks      *sideBook
+	updatedAt int64 // unix nanos, atomic-ish (single writer per feed goroutine)
 }
 
 func newBook(exchange, symbol string) *Book {
 	return &Book{
 		Exchange: exchange,
 		Symbol:   symbol,
-		Bids:     make(map[float64]float64, 512),
-		Asks:     make(map[float64]float64, 512),
+		bids:     newSideBook(false), // desc — best bid first
+		asks:     newSideBook(true),  // asc  — best ask first
 	}
 }
 
 func (b *Book) applyDelta(side string, price, qty float64) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	m := b.Bids
-	if side == "ask" {
-		m = b.Asks
-	}
-	if qty == 0 {
-		delete(m, price)
+	if side == "bid" {
+		b.bids.update(price, qty)
 	} else {
-		m[price] = qty
+		b.asks.update(price, qty)
 	}
-	b.UpdatedAt = time.Now()
+	b.updatedAt = time.Now().UnixNano()
 }
 
-// MarketImpact estimates price impact for a given notional (USD).
-// This is the core function — called by the cascade sim before every position decision.
+// MarketImpact — O(k) sweep, no allocations, no sort. This is the right path.
 func (b *Book) MarketImpact(side string, notionalUSD float64) (avgPrice, slippage float64) {
-	b.mu.RLock()
-	defer b.mu.RUnlock()
-
-	var levels []Level
 	if side == "sell" {
-		for p, q := range b.Bids {
-			levels = append(levels, Level{p, q})
-		}
-		sort.Slice(levels, func(i, j int) bool { return levels[i].Price > levels[j].Price })
-	} else {
-		for p, q := range b.Asks {
-			levels = append(levels, Level{p, q})
-		}
-		sort.Slice(levels, func(i, j int) bool { return levels[i].Price < levels[j].Price })
+		return b.bids.sweep(notionalUSD)
 	}
-
-	if len(levels) == 0 {
-		return 0, 1.0
-	}
-
-	topPrice := levels[0].Price
-	remaining := notionalUSD
-	totalQty := 0.0
-	totalCost := 0.0
-
-	for _, lvl := range levels {
-		fillQty := math.Min(remaining/lvl.Price, lvl.Size)
-		totalQty += fillQty
-		totalCost += fillQty * lvl.Price
-		remaining -= fillQty * lvl.Price
-		if remaining <= 0 {
-			break
-		}
-	}
-
-	if totalQty == 0 {
-		return 0, 1.0
-	}
-
-	avgPrice = totalCost / totalQty
-	if side == "sell" {
-		slippage = (topPrice - avgPrice) / topPrice
-	} else {
-		slippage = (avgPrice - topPrice) / topPrice
-	}
-	return avgPrice, slippage
+	return b.asks.sweep(notionalUSD)
 }
 
-// BinanceHandler feeds the ETH/USDT book from Binance depth stream.
+// BinanceHandler — depth@100ms stream for ETH/USDT.
+// Using the diff stream (not snapshot) so we need an initial snapshot on reconnect.
+// TODO: implement snapshot fetch + seq validation on reconnect.
 type BinanceHandler struct {
 	book *Book
 	log  *zap.SugaredLogger
@@ -117,47 +145,46 @@ func (h *BinanceHandler) Connect(ctx context.Context) error {
 	url := "wss://stream.binance.com:9443/ws/ethusdt@depth@100ms"
 	conn, _, err := websocket.DefaultDialer.DialContext(ctx, url, nil)
 	if err != nil {
-		return fmt.Errorf("binance ws dial: %w", err)
+		return fmt.Errorf("binance dial: %w", err)
 	}
 	defer conn.Close()
+	h.log.Info("binance book connected")
 
-	h.log.Info("binance book feed connected")
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
 		default:
 		}
-
 		_, msg, err := conn.ReadMessage()
 		if err != nil {
 			return fmt.Errorf("binance read: %w", err)
 		}
-		h.handleDepthMsg(msg)
+		h.handleDepth(msg)
 	}
 }
 
-type binanceDepthMsg struct {
+type binanceDepth struct {
 	Bids [][]json.RawMessage `json:"b"`
 	Asks [][]json.RawMessage `json:"a"`
 }
 
-func (h *BinanceHandler) handleDepthMsg(raw []byte) {
-	var msg binanceDepthMsg
-	if err := json.Unmarshal(raw, &msg); err != nil {
+func (h *BinanceHandler) handleDepth(raw []byte) {
+	var msg binanceDepth
+	if json.Unmarshal(raw, &msg) != nil {
 		return
 	}
 	for _, lvl := range msg.Bids {
-		p, q := parseLevel(lvl)
+		p, q := parseRawLevel(lvl)
 		h.book.applyDelta("bid", p, q)
 	}
 	for _, lvl := range msg.Asks {
-		p, q := parseLevel(lvl)
+		p, q := parseRawLevel(lvl)
 		h.book.applyDelta("ask", p, q)
 	}
 }
 
-// BybitHandler feeds the same symbol from Bybit for cross-venue slippage estimation.
+// BybitHandler — orderbook.50 linear stream.
 type BybitHandler struct {
 	book *Book
 	log  *zap.SugaredLogger
@@ -167,20 +194,18 @@ func (h *BybitHandler) Connect(ctx context.Context) error {
 	url := "wss://stream.bybit.com/v5/public/linear"
 	conn, _, err := websocket.DefaultDialer.DialContext(ctx, url, nil)
 	if err != nil {
-		return fmt.Errorf("bybit ws dial: %w", err)
+		return fmt.Errorf("bybit dial: %w", err)
 	}
 	defer conn.Close()
 
-	// subscribe to orderbook.50
-	sub := map[string]interface{}{
+	if err := conn.WriteJSON(map[string]any{
 		"op":   "subscribe",
 		"args": []string{"orderbook.50.ETHUSDT"},
-	}
-	if err := conn.WriteJSON(sub); err != nil {
+	}); err != nil {
 		return fmt.Errorf("bybit subscribe: %w", err)
 	}
+	h.log.Info("bybit book connected")
 
-	h.log.Info("bybit book feed connected")
 	for {
 		select {
 		case <-ctx.Done():
@@ -195,9 +220,8 @@ func (h *BybitHandler) Connect(ctx context.Context) error {
 	}
 }
 
-type bybitBookMsg struct {
+type bybitMsg struct {
 	Topic string `json:"topic"`
-	Type  string `json:"type"`
 	Data  struct {
 		Bids [][]string `json:"b"`
 		Asks [][]string `json:"a"`
@@ -205,35 +229,25 @@ type bybitBookMsg struct {
 }
 
 func (h *BybitHandler) handleMsg(raw []byte) {
-	var msg bybitBookMsg
-	if err := json.Unmarshal(raw, &msg); err != nil {
+	var msg bybitMsg
+	if json.Unmarshal(raw, &msg) != nil || msg.Topic == "" {
 		return
 	}
-	if msg.Topic == "" {
-		return // ping/pong or sub confirmation
-	}
 	for _, lvl := range msg.Data.Bids {
-		if len(lvl) != 2 {
-			continue
+		if len(lvl) == 2 {
+			p, q := parseStrLevel(lvl[0], lvl[1])
+			h.book.applyDelta("bid", p, q)
 		}
-		var p, q float64
-		fmt.Sscanf(lvl[0], "%f", &p)
-		fmt.Sscanf(lvl[1], "%f", &q)
-		h.book.applyDelta("bid", p, q)
 	}
 	for _, lvl := range msg.Data.Asks {
-		if len(lvl) != 2 {
-			continue
+		if len(lvl) == 2 {
+			p, q := parseStrLevel(lvl[0], lvl[1])
+			h.book.applyDelta("ask", p, q)
 		}
-		var p, q float64
-		fmt.Sscanf(lvl[0], "%f", &p)
-		fmt.Sscanf(lvl[1], "%f", &q)
-		h.book.applyDelta("ask", p, q)
 	}
 }
 
-// AggregatedBook merges multiple venue books for cross-exchange impact.
-// Simple approach: sweep the combined level set in price order.
+// AggregatedBook fans out slippage queries to each venue.
 type AggregatedBook struct {
 	books []*Book
 }
@@ -242,52 +256,51 @@ func newAggregatedBook(books ...*Book) *AggregatedBook {
 	return &AggregatedBook{books: books}
 }
 
+// SlippageForNotional returns per-venue + combined slippage for a given sell/buy size.
+// Combined is a simple average for now — TODO: proper cross-venue NBBO sweep.
 func (ab *AggregatedBook) SlippageForNotional(side string, notionalUSD float64) map[string]float64 {
 	result := make(map[string]float64, len(ab.books)+1)
-
-	// per-venue slippage
+	var sum float64
 	for _, b := range ab.books {
 		_, slip := b.MarketImpact(side, notionalUSD)
 		result[b.Exchange] = slip
-	}
-
-	// combined — just average for now
-	// TODO: proper NBBO sweep across merged level sets
-	var total float64
-	for _, v := range result {
-		total += v
+		sum += slip
 	}
 	if len(ab.books) > 0 {
-		result["combined"] = total / float64(len(ab.books))
+		result["combined"] = sum / float64(len(ab.books))
 	}
 	return result
 }
 
-func parseLevel(raw []json.RawMessage) (float64, float64) {
+// parseRawLevel handles Binance's [[string, string], ...] format.
+func parseRawLevel(raw []json.RawMessage) (float64, float64) {
 	if len(raw) < 2 {
 		return 0, 0
 	}
 	var ps, qs string
 	json.Unmarshal(raw[0], &ps)
 	json.Unmarshal(raw[1], &qs)
-	var p, q float64
-	fmt.Sscanf(ps, "%f", &p)
-	fmt.Sscanf(qs, "%f", &q)
+	p, _ := strconv.ParseFloat(ps, 64)
+	q, _ := strconv.ParseFloat(qs, 64)
 	return p, q
 }
 
-// SlippageServer runs in the background and serves slippage queries over ZMQ.
-// Risk engine and frontend both hit this.
-type SlippageServer struct {
-	agg *AggregatedBook
-	log *zap.SugaredLogger
+func parseStrLevel(ps, qs string) (float64, float64) {
+	p, _ := strconv.ParseFloat(ps, 64)
+	q, _ := strconv.ParseFloat(qs, 64)
+	return p, q
 }
 
-func (s *SlippageServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// TODO: replace with gRPC once the proto is settled
-	notional := float64(10_000_000) // default $10M
-	slippage := s.agg.SlippageForNotional("sell", notional)
-	json.NewEncoder(w).Encode(slippage)
+func withReconnect(ctx context.Context, name string, log *zap.SugaredLogger, fn func(context.Context) error) {
+	for {
+		if err := fn(ctx); err != nil && ctx.Err() == nil {
+			log.Warnw("reconnecting", "feed", name, "err", err)
+			time.Sleep(2 * time.Second)
+		}
+		if ctx.Err() != nil {
+			return
+		}
+	}
 }
 
 func main() {
@@ -299,43 +312,21 @@ func main() {
 	bybitBook   := newBook("bybit", "ETH/USDT")
 	agg         := newAggregatedBook(binanceBook, bybitBook)
 
-	binanceH := &BinanceHandler{book: binanceBook, log: log}
-	bybitH   := &BybitHandler{book: bybitBook, log: log}
-
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	go func() {
-		for {
-			if err := binanceH.Connect(ctx); err != nil && ctx.Err() == nil {
-				log.Warnw("binance reconnecting", "err", err)
-				time.Sleep(2 * time.Second)
-			}
-		}
-	}()
+	go withReconnect(ctx, "binance", log, (&BinanceHandler{book: binanceBook, log: log}).Connect)
+	go withReconnect(ctx, "bybit",   log, (&BybitHandler{book: bybitBook, log: log}).Connect)
 
-	go func() {
-		for {
-			if err := bybitH.Connect(ctx); err != nil && ctx.Err() == nil {
-				log.Warnw("bybit reconnecting", "err", err)
-				time.Sleep(2 * time.Second)
-			}
-		}
-	}()
-
-	// periodic slippage log — useful for sanity checks
 	go func() {
 		t := time.NewTicker(10 * time.Second)
 		defer t.Stop()
 		for {
 			select {
 			case <-t.C:
-				for _, notional := range []float64{1e6, 5e6, 10e6} {
-					slips := agg.SlippageForNotional("sell", notional)
-					log.Infow("slippage snapshot",
-						"notional", notional,
-						"slippage", slips,
-					)
+				for _, n := range []float64{1e6, 5e6, 10e6} {
+					s := agg.SlippageForNotional("sell", n)
+					log.Infow("slippage", "notional", n, "slip", s)
 				}
 			case <-ctx.Done():
 				return
@@ -343,10 +334,8 @@ func main() {
 		}
 	}()
 
-	_ = agg // used by slippage server above — compiler stop complaining
-
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	<-sigCh
-	log.Info("shutting down aggregator")
+	log.Info("aggregator shutting down")
 }
