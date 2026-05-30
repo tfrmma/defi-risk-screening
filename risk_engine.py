@@ -1,7 +1,9 @@
 """
 risk_engine.py — HF calculator + whale tracker
-Reads dirty accounts from Redis, pulls on-chain state, recomputes HF.
-Publishes risk events to ZMQ for downstream consumers.
+
+Zero RPC calls in the hot path. State is built entirely from Redis,
+which the Go indexer keeps current via on-chain events.
+The only time we touch the node is for oracle lag checks (low frequency).
 """
 
 from __future__ import annotations
@@ -21,60 +23,40 @@ from web3 import AsyncWeb3, WebSocketProvider
 
 log = logging.getLogger(__name__)
 
-# --- ABI stubs (trimmed to what we actually call) ---
-
-AAVE_POOL_ABI = [
-    {
-        "name": "getUserAccountData",
-        "type": "function",
-        "inputs": [{"name": "user", "type": "address"}],
-        "outputs": [
-            {"name": "totalCollateralBase", "type": "uint256"},
-            {"name": "totalDebtBase", "type": "uint256"},
-            {"name": "availableBorrowsBase", "type": "uint256"},
-            {"name": "currentLiquidationThreshold", "type": "uint256"},
-            {"name": "ltv", "type": "uint256"},
-            {"name": "healthFactor", "type": "uint256"},
-        ],
-    },
-    {
-        "name": "getUserEMode",
-        "type": "function",
-        "inputs": [{"name": "user", "type": "address"}],
-        "outputs": [{"name": "", "type": "uint256"}],
-    },
-]
-
-MORPHO_HUB_ABI = [
-    {
-        "name": "position",
-        "type": "function",
-        "inputs": [
-            {"name": "id", "type": "bytes32"},
-            {"name": "user", "type": "address"},
-        ],
-        "outputs": [
-            {"name": "supplyShares", "type": "uint128"},
-            {"name": "borrowShares", "type": "uint128"},
-            {"name": "collateral", "type": "uint128"},
-        ],
-    }
-]
-
-RAY = Decimal(10**27)
 WAD = Decimal(10**18)
+RAY = Decimal(10**27)
+
+# eMode liquidation thresholds — pull from protocol config in prod
+# these are the Aave V3 mainnet defaults
+EMODE_LT = {
+    0: Decimal("0.825"),   # standard
+    1: Decimal("0.930"),   # ETH correlated
+    2: Decimal("0.970"),   # stablecoin
+}
+
+
+@dataclass
+class AccountState:
+    """Reconstructed from Redis — no RPC involved."""
+    address:  str
+    protocol: str
+    # per-asset positions keyed by token address
+    collateral: dict[str, Decimal]  # token -> amount in base units
+    debt:       dict[str, Decimal]
+    emode_id:   int
+    updated_at: float
 
 
 @dataclass
 class AccountRisk:
-    address: str
+    address:        str
     collateral_usd: Decimal
-    debt_usd: Decimal
-    health_factor: Decimal
-    emode_id: int
-    protocol: str
-    liq_price_usd: Optional[Decimal] = None  # estimated liquidation trigger price
-    updated_at: float = field(default_factory=time.time)
+    debt_usd:       Decimal
+    health_factor:  Decimal
+    emode_id:       int
+    protocol:       str
+    liq_price_est:  Optional[Decimal] = None
+    updated_at:     float = field(default_factory=time.time)
 
     @property
     def is_at_risk(self) -> bool:
@@ -85,119 +67,158 @@ class AccountRisk:
         return self.health_factor < Decimal("1.05")
 
 
-class AaveRiskCalculator:
+class LocalStateReader:
     """
-    Wraps getUserAccountData but also does local HF simulation for oracle-lag estimation.
-    We call the contract for ground truth, then use local math for delta projections.
+    Reads account positions from Redis as maintained by the Go indexer.
+    Format written by indexer: hash at acct:{protocol}:{address}:{token}
+    keys: collateral_raw, debt_raw, decimals, price_usd (updated by oracle tracker)
     """
 
-    def __init__(self, w3: AsyncWeb3, pool_addr: str, oracle_addr: str):
-        self.pool = w3.eth.contract(
-            address=AsyncWeb3.to_checksum_address(pool_addr),
-            abi=AAVE_POOL_ABI,
-        )
-        self.oracle_addr = oracle_addr
+    def __init__(self, rdb: aioredis.Redis):
+        self.rdb = rdb
 
-    async def fetch_account(self, user: str) -> AccountRisk:
-        addr = AsyncWeb3.to_checksum_address(user)
-        data, emode = await asyncio.gather(
-            self.pool.functions.getUserAccountData(addr).call(),
-            self.pool.functions.getUserEMode(addr).call(),
-        )
+    async def load_account(self, protocol: str, address: str) -> Optional[AccountRisk]:
+        # grab all token positions for this account in one pipeline
+        pattern = f"acct:{protocol}:{address}:*"
+        keys = await self.rdb.keys(pattern)
+        if not keys:
+            return None
 
-        collateral_usd = Decimal(data[0]) / Decimal(10**8)
-        debt_usd = Decimal(data[1]) / Decimal(10**8)
-        hf_raw = Decimal(data[5]) / WAD
+        pipe = self.rdb.pipeline(transaction=False)
+        for k in keys:
+            pipe.hgetall(k)
+        raw_positions = await pipe.execute()
 
-        # emode changes liquidation thresholds — need to account for this
-        # in the liq_price estimation below. TODO: pull emode category config
+        emode_raw = await self.rdb.get(f"acct:{protocol}:{address}:emode")
+        emode_id = int(emode_raw or 0)
+        lt = EMODE_LT.get(emode_id, EMODE_LT[0])
+
+        total_collateral_usd = Decimal("0")
+        weighted_col_usd     = Decimal("0")  # weighted by liquidation threshold
+        total_debt_usd       = Decimal("0")
+
+        for pos in raw_positions:
+            if not pos:
+                continue
+            col_raw  = Decimal(pos.get("collateral_raw", "0"))
+            debt_raw = Decimal(pos.get("debt_raw", "0"))
+            decimals = int(pos.get("decimals", "18"))
+            price    = Decimal(pos.get("price_usd", "0"))
+
+            if price == 0:
+                continue  # oracle hasn't updated this token yet — skip rather than miscount
+
+            scale = Decimal(10**decimals)
+            col_usd  = col_raw  / scale * price
+            debt_usd = debt_raw / scale * price
+
+            total_collateral_usd += col_usd
+            weighted_col_usd     += col_usd * lt
+            total_debt_usd       += debt_usd
+
+        if total_debt_usd == 0:
+            return None  # no debt = not interesting
+
+        hf = weighted_col_usd / total_debt_usd
+
         return AccountRisk(
-            address=user,
-            collateral_usd=collateral_usd,
-            debt_usd=debt_usd,
-            health_factor=hf_raw,
-            emode_id=emode,
-            protocol="aave_v3",
+            address=address,
+            protocol=protocol,
+            collateral_usd=total_collateral_usd,
+            debt_usd=total_debt_usd,
+            health_factor=hf,
+            emode_id=emode_id,
+            liq_price_est=self._estimate_liq_price(total_collateral_usd, total_debt_usd, lt),
         )
 
-    def estimate_liq_price(self, acct: AccountRisk, liq_threshold: Decimal) -> Decimal:
-        """
-        Reverse-engineer the price at which HF hits 1.0.
-        Assumes single collateral asset — multi-asset accounts need separate handling.
-        Close enough for whale tracking purposes.
-        """
-        if acct.debt_usd == 0:
+    def _estimate_liq_price(
+        self,
+        col_usd: Decimal,
+        debt_usd: Decimal,
+        lt: Decimal,
+    ) -> Decimal:
+        # ratio at which HF = 1.0 relative to current collateral price
+        # single-asset approximation — good enough for whale clustering
+        if col_usd == 0 or lt == 0:
             return Decimal("0")
-        # HF = (col * price * lt) / debt = 1  =>  price = debt / (col_qty * lt)
-        # but we only have USD values, so: liq_price = debt / (col_usd/current_price * lt)
-        # simplified: liq_price ≈ current_col_price * (debt / (col_usd * lt))
-        return acct.debt_usd / (acct.collateral_usd * liq_threshold)
+        return debt_usd / (col_usd * lt)
 
 
-class MorphoRiskCalculator:
-    """Morpho Blue — market-scoped positions, simpler than Aave."""
-
-    def __init__(self, w3: AsyncWeb3, hub_addr: str):
-        self.hub = w3.eth.contract(
-            address=AsyncWeb3.to_checksum_address(hub_addr),
-            abi=MORPHO_HUB_ABI,
-        )
-
-    async def fetch_position(self, market_id: str, user: str) -> dict:
-        mid = bytes.fromhex(market_id.lstrip("0x"))
-        addr = AsyncWeb3.to_checksum_address(user)
-        pos = await self.hub.functions.position(mid, addr).call()
-        return {
-            "supply_shares": pos[0],
-            "borrow_shares": pos[1],
-            "collateral": pos[2],
-        }
-
-
-class OracleLagEstimator:
+class OraclePriceUpdater:
     """
-    Chainlink heartbeat vs actual price feed timing.
-    The lag between spot move and on-chain oracle update is the alpha window.
+    Periodically fetches oracle prices and writes them into Redis so
+    LocalStateReader can do HF math without touching the node.
+    This runs at low frequency (every 10s) — it's not on the hot path.
     """
 
-    CHAINLINK_HEARTBEATS = {
-        "ETH/USD": 3600,   # 1hr max, but ~20min in practice
-        "BTC/USD": 3600,
-        "USDC/USD": 86400,
+    FEEDS = {
+        # token_addr -> chainlink_feed_addr
+        "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2": "0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419",  # WETH
+        "0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599": "0xF4030086522a5bEEa4988F8cA5B36dbC97BeE88c",  # WBTC
+        "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48": "0x8fFfFfd4AfB6115b954Bd326cbe7B4BA576818f6",  # USDC
     }
 
-    def __init__(self, w3: AsyncWeb3):
-        self.w3 = w3
-        self._last_updates: dict[str, int] = {}
+    FEED_ABI = [{"name": "latestRoundData", "type": "function", "inputs": [], "outputs": [
+        {"name": "roundId",         "type": "uint80"},
+        {"name": "answer",          "type": "int256"},
+        {"name": "startedAt",       "type": "uint256"},
+        {"name": "updatedAt",       "type": "uint256"},
+        {"name": "answeredInRound", "type": "uint80"},
+    ]}]
 
-    async def get_lag_seconds(self, pair: str, feed_addr: str) -> float:
-        """Returns seconds since last oracle update. High lag = bigger alpha window."""
-        # minimal ABI — just latestRoundData
-        abi = [{"name": "latestRoundData", "type": "function", "inputs": [],
-                "outputs": [
-                    {"name": "roundId", "type": "uint80"},
-                    {"name": "answer", "type": "int256"},
-                    {"name": "startedAt", "type": "uint256"},
-                    {"name": "updatedAt", "type": "uint256"},
-                    {"name": "answeredInRound", "type": "uint80"},
-                ]}]
-        feed = self.w3.eth.contract(
-            address=AsyncWeb3.to_checksum_address(feed_addr), abi=abi
-        )
-        data = await feed.functions.latestRoundData().call()
-        updated_at = data[3]
-        lag = time.time() - updated_at
-        self._last_updates[pair] = updated_at
-        return lag
+    def __init__(self, w3: AsyncWeb3, rdb: aioredis.Redis):
+        self.w3  = w3
+        self.rdb = rdb
+        self._feeds = {
+            addr: w3.eth.contract(
+                address=AsyncWeb3.to_checksum_address(feed),
+                abi=self.FEED_ABI,
+            )
+            for addr, feed in self.FEEDS.items()
+        }
+
+    async def run(self):
+        while True:
+            await self._refresh_all()
+            await asyncio.sleep(10)
+
+    async def _refresh_all(self):
+        tasks = [self._refresh_token(token, feed) for token, feed in self._feeds.items()]
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _refresh_token(self, token_addr: str, feed):
+        try:
+            data = await feed.functions.latestRoundData().call()
+            price_usd = Decimal(data[1]) / Decimal(10**8)   # chainlink answers in 8 decimals
+            updated_at = data[3]
+
+            lag = time.time() - updated_at
+            await self.rdb.set(f"oracle:price:{token_addr}", str(price_usd))
+            await self.rdb.set(f"oracle:lag:{token_addr}", str(lag))
+
+            # propagate price into all account positions for this token
+            # Go indexer writes position keys with token_addr embedded
+            # we just need to update the price field
+            pattern = f"acct:*:*:{token_addr}"
+            keys = await self.rdb.keys(pattern)
+            if keys:
+                pipe = self.rdb.pipeline(transaction=False)
+                for k in keys:
+                    pipe.hset(k, "price_usd", str(price_usd))
+                await pipe.execute()
+
+        except Exception as e:
+            log.debug("oracle refresh failed for %s: %s", token_addr[:10], e)
 
 
 class RiskEngine:
     def __init__(self, cfg: dict):
-        self.cfg = cfg
-        self.rdb: aioredis.Redis = None
-        self.zmq_ctx = zmq.asyncio.Context()
-        self.pub: zmq.asyncio.Socket = None
-        self.aave_calc: AaveRiskCalculator = None
+        self.cfg      = cfg
+        self.rdb: aioredis.Redis       = None
+        self.zmq_ctx  = zmq.asyncio.Context()
+        self.pub: zmq.asyncio.Socket   = None
+        self.reader: LocalStateReader  = None
+        self.oracle_updater: OraclePriceUpdater = None
 
     async def setup(self):
         self.rdb = aioredis.from_url(
@@ -207,82 +228,83 @@ class RiskEngine:
         self.pub = self.zmq_ctx.socket(zmq.PUB)
         self.pub.bind(self.cfg["zmq"]["alert_pub"])
 
+        self.reader = LocalStateReader(self.rdb)
+
+        # oracle updater needs the node — but only for price fetches, not account state
         w3 = AsyncWeb3(WebSocketProvider(self.cfg["rpc"]["ws_url"]))
-        self.aave_calc = AaveRiskCalculator(
-            w3,
-            self.cfg["protocols"]["aave_v3"]["pool"],
-            self.cfg["protocols"]["aave_v3"]["oracle"],
-        )
+        self.oracle_updater = OraclePriceUpdater(w3, self.rdb)
 
     async def run(self):
         await self.setup()
-        log.info("risk engine running")
+        log.info("risk engine running — no RPC on hot path")
+
+        # oracle runs in background at low freq
+        asyncio.create_task(self.oracle_updater.run())
+
         while True:
             await self._process_dirty_batch()
-            await asyncio.sleep(0.5)  # 500ms tick — fast enough, not stupid
+            await asyncio.sleep(0.1)  # tighter tick now that we're not waiting on RPC
 
     async def _process_dirty_batch(self):
-        # pop up to 50 accounts per tick — don't try to drain the whole set at once
-        accounts = await self.rdb.spop("dirty:accounts", 50)
+        # pop 100 per tick — we can afford more now that eval is just Redis reads + math
+        accounts = await self.rdb.spop("dirty:accounts", 100)
         if not accounts:
             return
 
-        tasks = [self._evaluate_account(addr) for addr in accounts]
+        tasks = [self._evaluate_account(entry) for entry in accounts]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         for r in results:
             if isinstance(r, Exception):
-                log.warning("account eval failed: %s", r)
+                log.warning("account eval error: %s", r)
 
-    async def _evaluate_account(self, address: str):
-        try:
-            acct = await self.aave_calc.fetch_account(address)
-        except Exception as e:
-            log.debug("fetch failed for %s: %s", address, e)
-            # re-queue so we don't silently drop it
-            await self.rdb.sadd("dirty:accounts", address)
+    async def _evaluate_account(self, entry: str):
+        # entry format: "protocol:address" — written by Go indexer
+        parts = entry.split(":", 1)
+        if len(parts) != 2:
+            log.debug("malformed dirty entry: %s", entry)
             return
 
-        # cache the risk snapshot
-        await self._cache_account_risk(acct)
+        protocol, address = parts
+        risk = await self.reader.load_account(protocol, address)
+        if risk is None:
+            return
 
-        if acct.is_at_risk:
-            await self._publish_risk_event(acct)
-            log.info("at-risk account %s HF=%.4f", address[:10], acct.health_factor)
+        await self._cache_risk(risk)
 
-    async def _cache_account_risk(self, acct: AccountRisk):
-        key = f"risk:{acct.protocol}:{acct.address}"
-        await self.rdb.hset(key, mapping={
-            "collateral_usd": str(acct.collateral_usd),
-            "debt_usd":       str(acct.debt_usd),
-            "health_factor":  str(acct.health_factor),
-            "emode_id":       acct.emode_id,
-            "updated_at":     acct.updated_at,
+        if risk.is_at_risk:
+            await self._publish_risk_event(risk)
+            log.info("at-risk %s proto=%s HF=%.4f", address[:10], protocol, risk.health_factor)
+
+    async def _cache_risk(self, risk: AccountRisk):
+        key = f"risk:{risk.protocol}:{risk.address}"
+        pipe = self.rdb.pipeline(transaction=False)
+        pipe.hset(key, mapping={
+            "collateral_usd": str(risk.collateral_usd),
+            "debt_usd":       str(risk.debt_usd),
+            "health_factor":  str(risk.health_factor),
+            "emode_id":       risk.emode_id,
+            "liq_price_est":  str(risk.liq_price_est or 0),
+            "updated_at":     risk.updated_at,
         })
-        await self.rdb.expire(key, 300)  # 5min — will get refreshed anyway
+        pipe.expire(key, 300)
+        if risk.is_at_risk:
+            pipe.zadd("at_risk:accounts", {f"{risk.protocol}:{risk.address}": float(risk.health_factor)})
+        await pipe.execute()
 
-        if acct.is_at_risk:
-            # also add to sorted set keyed by HF for fast range queries
-            await self.rdb.zadd(
-                "at_risk:accounts",
-                {acct.address: float(acct.health_factor)},
-            )
-
-    async def _publish_risk_event(self, acct: AccountRisk):
+    async def _publish_risk_event(self, risk: AccountRisk):
         payload = {
             "type":           "RISK_UPDATE",
-            "address":        acct.address,
-            "protocol":       acct.protocol,
-            "health_factor":  str(acct.health_factor),
-            "collateral_usd": str(acct.collateral_usd),
-            "debt_usd":       str(acct.debt_usd),
-            "critical":       acct.is_critical,
-            "ts":             acct.updated_at,
+            "address":        risk.address,
+            "protocol":       risk.protocol,
+            "health_factor":  str(risk.health_factor),
+            "collateral_usd": str(risk.collateral_usd),
+            "debt_usd":       str(risk.debt_usd),
+            "liq_price_est":  str(risk.liq_price_est or 0),
+            "critical":       risk.is_critical,
+            "ts":             risk.updated_at,
         }
-        await self.pub.send_multipart([
-            b"risk",
-            json.dumps(payload).encode(),
-        ])
+        await self.pub.send_multipart([b"risk", json.dumps(payload).encode()])
 
 
 async def main():
@@ -292,8 +314,7 @@ async def main():
     with open("config/config.yaml") as f:
         cfg = yaml.safe_load(f)
 
-    engine = RiskEngine(cfg)
-    await engine.run()
+    await RiskEngine(cfg).run()
 
 
 if __name__ == "__main__":
