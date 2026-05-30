@@ -1,7 +1,12 @@
 """
-arb_engine.py — yield arbitrage screener (cash & carry, funding vs borrow)
-Scans for spread between on-chain borrow rates and perpetual funding rates.
-Filters on CVD to avoid entering delta-neutral carries into a squeeze.
+arb_engine.py — yield arbitrage screener
+
+Funding rates come via WebSocket now, not REST. The old REST approach had
+~500ms staleness and rate limit exposure. Not acceptable for carry sizing.
+
+CVD filter is also smarter: high CVD only flags squeeze risk if price is
+actually moving up. CVD spike + flat price = absorption, which is a
+distribution signal — exactly when you want to be short.
 """
 
 from __future__ import annotations
@@ -10,26 +15,38 @@ import asyncio
 import json
 import logging
 import time
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Optional
 
 import aiohttp
 import redis.asyncio as aioredis
+import websockets
 import zmq.asyncio
 from web3 import AsyncWeb3, WebSocketProvider
 
 log = logging.getLogger(__name__)
 
-# annualization factor — everything normalized to APY
-SECONDS_PER_YEAR = 365 * 24 * 3600
+MIN_NET_APY    = Decimal("0.04")
+EXEC_COST_BPS  = Decimal("0.005")   # ~50bps round-trip
 
-# minimum net spread to bother alerting on
-MIN_NET_APY = Decimal("0.04")  # 4%
+# CVD window for displacement ratio calculation
+CVD_WINDOW_SECS = 300
 
-# CVD threshold: if spot cumulative delta exceeds this, we flag squeeze risk
-# crude but effective — gets you out before the carry explodes in your face
-CVD_SQUEEZE_THRESHOLD = 0.65
+# if CVD Z-score is above this BUT price hasn't moved proportionally → absorption
+CVD_HIGH_THRESHOLD   = 0.65
+PRICE_MOVE_MIN_RATIO = 0.30   # price should move at least 30% as much as CVD implies
+
+
+@dataclass
+class FundingRate:
+    venue:     str
+    symbol:    str
+    rate_8h:   Decimal
+    apy:       Decimal     # rate_8h * 3 * 365
+    oi_usd:    Decimal
+    timestamp: float
 
 
 @dataclass
@@ -37,46 +54,28 @@ class BorrowRate:
     protocol: str
     asset:    str
     apy:      Decimal
-    utilization: Decimal
-    supply_apy:  Decimal
-    timestamp:   float
-
-
-@dataclass
-class FundingRate:
-    venue:     str
-    symbol:    str
-    rate_8h:   Decimal     # raw 8h rate
-    apy:       Decimal     # annualized: rate_8h * 3 * 365
-    oi_usd:    Decimal
     timestamp: float
 
 
 @dataclass
 class CarryOpportunity:
-    long_asset:    str        # borrow this on-chain
-    short_venue:   str        # short perpetual here
-    borrow_apy:    Decimal
-    funding_apy:   Decimal
-    net_apy:       Decimal
-    oi_usd:        Decimal
-    squeeze_risk:  bool       # CVD says someone's loading up on spot
+    long_asset:   str
+    short_venue:  str
+    borrow_apy:   Decimal
+    funding_apy:  Decimal
+    net_apy:      Decimal
+    oi_usd:       Decimal
+    squeeze_risk: bool
+    absorption:   bool      # CVD high but price not moving = distribution in progress
 
 
-AAVE_POOL_ABI = [
-    {
-        "name": "getReserveData",
-        "type": "function",
-        "inputs": [{"name": "asset", "type": "address"}],
-        "outputs": [
-            # trimmed — only pulling what we need
-            {"name": "currentLiquidityRate", "type": "uint128"},
-            {"name": "currentVariableBorrowRate", "type": "uint128"},
-        ],
-    }
-]
+AAVE_RESERVE_ABI = [{"name": "getReserveData", "type": "function",
+    "inputs": [{"name": "asset", "type": "address"}],
+    "outputs": [
+        {"name": "currentLiquidityRate",    "type": "uint128"},
+        {"name": "currentVariableBorrowRate","type": "uint128"},
+    ]}]
 
-# mainnet token addresses
 ASSETS = {
     "USDC": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
     "USDT": "0xdAC17F958D2ee523a2206206994597C13D831ec7",
@@ -84,178 +83,222 @@ ASSETS = {
     "WBTC": "0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599",
 }
 
+PERP_TO_ASSET = {"ETH": "WETH", "BTC": "WBTC", "USDC": "USDC", "SOL": "SOL"}
+
 
 class AaveBorrowRates:
+    """Still using RPC here — borrow rates move on block cadence, not tick cadence.
+    30s polling is fine. Doesn't belong on a WebSocket."""
+
     def __init__(self, w3: AsyncWeb3, pool_addr: str):
         self.pool = w3.eth.contract(
             address=AsyncWeb3.to_checksum_address(pool_addr),
-            abi=AAVE_POOL_ABI,
+            abi=AAVE_RESERVE_ABI,
         )
 
     async def fetch_all(self) -> list[BorrowRate]:
-        tasks = [self._fetch_asset(sym, addr) for sym, addr in ASSETS.items()]
+        tasks = [self._fetch(sym, addr) for sym, addr in ASSETS.items()]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         return [r for r in results if isinstance(r, BorrowRate)]
 
-    async def _fetch_asset(self, symbol: str, asset_addr: str) -> BorrowRate:
+    async def _fetch(self, symbol: str, asset_addr: str) -> BorrowRate:
         data = await self.pool.functions.getReserveData(
             AsyncWeb3.to_checksum_address(asset_addr)
         ).call()
-
         ray = Decimal(10**27)
-        # Aave rates are in RAY (27 decimals), already annualized
-        supply_apy  = Decimal(data[0]) / ray
-        borrow_apy  = Decimal(data[1]) / ray
-
-        # derive utilization from the kink model — not exposed directly
-        # this is an approximation; exact calc requires reserveData struct
-        utilization = borrow_apy / (supply_apy + borrow_apy) if supply_apy > 0 else Decimal("0")
-
         return BorrowRate(
             protocol="aave_v3",
             asset=symbol,
-            apy=borrow_apy,
-            utilization=utilization,
-            supply_apy=supply_apy,
+            apy=Decimal(data[1]) / ray,
             timestamp=time.time(),
         )
 
 
-class FundingRateAggregator:
-    """Pulls funding rates from Binance, Bybit, Hyperliquid."""
+class BinanceFundingWS:
+    """
+    Binance markPrice stream — broadcasts funding rate + mark price in real time.
+    Much better than polling premiumIndex REST.
+    """
 
-    async def fetch_all(self) -> list[FundingRate]:
-        results = await asyncio.gather(
-            self._binance_funding(),
-            self._bybit_funding(),
-            self._hyperliquid_funding(),
-            return_exceptions=True,
-        )
-        rates = []
-        for r in results:
-            if isinstance(r, list):
-                rates.extend(r)
-            elif isinstance(r, Exception):
-                log.warning("funding fetch error: %s", r)
-        return rates
+    WS_URL = "wss://fstream.binance.com/stream?streams=ethusdt@markPrice/btcusdt@markPrice/solusdt@markPrice"
 
-    async def _binance_funding(self) -> list[FundingRate]:
-        url = "https://fapi.binance.com/fapi/v1/premiumIndex"
-        symbols = ["ETHUSDT", "BTCUSDT", "SOLUSDT"]
-        rates = []
+    def __init__(self, store: dict[str, FundingRate]):
+        self._store = store  # shared with ArbScreener
 
-        async with aiohttp.ClientSession() as sess:
-            for sym in symbols:
-                async with sess.get(url, params={"symbol": sym}) as resp:
-                    if resp.status != 200:
-                        continue
-                    data = await resp.json()
-                    rate_8h = Decimal(str(data.get("lastFundingRate", "0")))
-                    rates.append(FundingRate(
-                        venue="binance",
-                        symbol=sym,
-                        rate_8h=rate_8h,
-                        apy=rate_8h * 3 * 365,   # 3 settlements/day
-                        oi_usd=Decimal("0"),      # TODO: pull OI separately
-                        timestamp=time.time(),
-                    ))
-        return rates
+    async def run(self):
+        while True:
+            try:
+                async with websockets.connect(self.WS_URL, ping_interval=20) as ws:
+                    log.info("binance funding WS connected")
+                    async for raw in ws:
+                        self._handle(raw)
+            except Exception as e:
+                log.warning("binance funding WS error: %s — reconnecting", e)
+                await asyncio.sleep(2)
 
-    async def _bybit_funding(self) -> list[FundingRate]:
-        url = "https://api.bybit.com/v5/market/tickers"
-        symbols = ["ETHUSDT", "BTCUSDT"]
-        rates = []
+    def _handle(self, raw: str):
+        try:
+            outer = json.loads(raw)
+            data  = outer.get("data", outer)
+            sym   = data.get("s", "")
+            rate  = Decimal(str(data.get("r", "0")))  # "r" = funding rate
+            self._store[f"binance:{sym}"] = FundingRate(
+                venue="binance",
+                symbol=sym,
+                rate_8h=rate,
+                apy=rate * 3 * 365,
+                oi_usd=Decimal("0"),  # not in markPrice stream; grab from REST on startup
+                timestamp=time.time(),
+            )
+        except Exception:
+            pass  # malformed frame — ignore and move on
 
-        async with aiohttp.ClientSession() as sess:
-            for sym in symbols:
-                async with sess.get(url, params={"category": "linear", "symbol": sym}) as resp:
-                    if resp.status != 200:
-                        continue
-                    data = await resp.json()
-                    items = data.get("result", {}).get("list", [])
-                    if not items:
-                        continue
-                    item = items[0]
-                    rate_8h = Decimal(str(item.get("fundingRate", "0")))
-                    oi = Decimal(str(item.get("openInterestValue", "0")))
-                    rates.append(FundingRate(
-                        venue="bybit",
-                        symbol=sym,
-                        rate_8h=rate_8h,
-                        apy=rate_8h * 3 * 365,
-                        oi_usd=oi,
-                        timestamp=time.time(),
-                    ))
-        return rates
 
-    async def _hyperliquid_funding(self) -> list[FundingRate]:
-        # Hyperliquid has non-standard API — this is their meta endpoint
-        url = "https://api.hyperliquid.xyz/info"
-        rates = []
+class BybitFundingWS:
+    """
+    Bybit tickers stream — includes fundingRate and openInterestValue.
+    """
 
-        async with aiohttp.ClientSession() as sess:
-            async with sess.post(url, json={"type": "metaAndAssetCtxs"}) as resp:
-                if resp.status != 200:
-                    return []
-                data = await resp.json()
+    WS_URL    = "wss://stream.bybit.com/v5/public/linear"
+    SYMBOLS   = ["ETHUSDT", "BTCUSDT"]
 
-        meta_assets = data[0].get("universe", [])
-        asset_ctxs  = data[1]
+    def __init__(self, store: dict[str, FundingRate]):
+        self._store = store
 
-        target_symbols = {"ETH", "BTC", "SOL"}
-        for i, asset in enumerate(meta_assets):
-            if asset["name"] not in target_symbols:
-                continue
-            ctx = asset_ctxs[i]
-            rate_8h = Decimal(str(ctx.get("funding", "0")))
-            oi = Decimal(str(ctx.get("openInterest", "0"))) * Decimal(str(ctx.get("markPx", "0")))
-            rates.append(FundingRate(
-                venue="hyperliquid",
-                symbol=asset["name"] + "USDT",
-                rate_8h=rate_8h,
-                apy=rate_8h * 3 * 365,
+    async def run(self):
+        while True:
+            try:
+                async with websockets.connect(self.WS_URL, ping_interval=20) as ws:
+                    sub = {"op": "subscribe", "args": [f"tickers.{s}" for s in self.SYMBOLS]}
+                    await ws.send(json.dumps(sub))
+                    log.info("bybit funding WS connected")
+                    async for raw in ws:
+                        self._handle(raw)
+            except Exception as e:
+                log.warning("bybit funding WS error: %s — reconnecting", e)
+                await asyncio.sleep(2)
+
+    def _handle(self, raw: str):
+        try:
+            msg  = json.loads(raw)
+            data = msg.get("data", {})
+            sym  = data.get("symbol", "")
+            if not sym:
+                return
+            rate = Decimal(str(data.get("fundingRate", "0")))
+            oi   = Decimal(str(data.get("openInterestValue", "0")))
+            self._store[f"bybit:{sym}"] = FundingRate(
+                venue="bybit",
+                symbol=sym,
+                rate_8h=rate,
+                apy=rate * 3 * 365,
                 oi_usd=oi,
                 timestamp=time.time(),
-            ))
-        return rates
+            )
+        except Exception:
+            pass
 
 
-class CVDMonitor:
+class HyperliquidFundingPoller:
     """
-    Tracks cumulative spot delta (CVD) from trade tape.
-    High positive CVD + stable price = absorption (institutional buy).
-    In that case, don't lean short even if there's a liq cluster below.
+    Hyperliquid doesn't have a real-time WS for funding yet (as of mid-2025).
+    Polling their /info endpoint every 30s is still better than Binance REST
+    because HL settlements are more frequent.
+    TODO: check if they've shipped a WS funding channel.
     """
 
-    def __init__(self, rdb: aioredis.Redis):
-        self.rdb = rdb
+    URL = "https://api.hyperliquid.xyz/info"
+    TARGET = {"ETH", "BTC", "SOL"}
 
-    async def get_cvd_zscore(self, symbol: str, window: int = 300) -> float:
+    def __init__(self, store: dict[str, FundingRate]):
+        self._store = store
+
+    async def run(self):
+        while True:
+            try:
+                await self._poll()
+            except Exception as e:
+                log.warning("hyperliquid poll error: %s", e)
+            await asyncio.sleep(30)
+
+    async def _poll(self):
+        async with aiohttp.ClientSession() as sess:
+            async with sess.post(self.URL, json={"type": "metaAndAssetCtxs"}) as resp:
+                if resp.status != 200:
+                    return
+                data = await resp.json()
+
+        for asset, ctx in zip(data[0].get("universe", []), data[1]):
+            if asset["name"] not in self.TARGET:
+                continue
+            rate = Decimal(str(ctx.get("funding", "0")))
+            oi   = Decimal(str(ctx.get("openInterest", "0"))) * Decimal(str(ctx.get("markPx", "1")))
+            sym  = asset["name"] + "USDT"
+            self._store[f"hyperliquid:{sym}"] = FundingRate(
+                venue="hyperliquid",
+                symbol=sym,
+                rate_8h=rate,
+                apy=rate * 3 * 365,
+                oi_usd=oi,
+                timestamp=time.time(),
+            )
+
+
+class CVDDisplacementMonitor:
+    """
+    Smarter CVD filter: compares cumulative delta against actual price displacement.
+
+    High CVD + proportional price move = real demand → squeeze risk, skip carry.
+    High CVD + flat price = absorption/distribution → good carry entry, proceed.
+
+    Both CVD and price samples are written into Redis by the order book feed handler.
+    We read a rolling window and compute the ratio here.
+    """
+
+    def __init__(self, rdb: aioredis.Redis, window_secs: int = CVD_WINDOW_SECS):
+        self.rdb    = rdb
+        self.window = window_secs
+
+    async def classify(self, symbol: str) -> tuple[bool, bool]:
         """
-        Returns Z-score of CVD over the last `window` seconds.
-        Stored in Redis by the CEX feed handler.
-        Positive Z > CVD_SQUEEZE_THRESHOLD = absorbing, don't short.
+        Returns (squeeze_risk, absorption).
+        squeeze_risk: true price move matching CVD — real buying pressure
+        absorption:   CVD spike but price not moving — smart money distributing
         """
-        key = f"cvd:{symbol}:zscore"
+        cvd_z    = await self._get_float(f"cvd:{symbol}:zscore")
+        price_z  = await self._get_float(f"price:{symbol}:zscore_5m")
+
+        if cvd_z is None or abs(cvd_z) < CVD_HIGH_THRESHOLD:
+            return False, False  # nothing interesting
+
+        # how much of the CVD move is showing up in price?
+        displacement_ratio = abs(price_z) / abs(cvd_z) if cvd_z != 0 else 0
+
+        if displacement_ratio >= PRICE_MOVE_MIN_RATIO:
+            # price moving with CVD — real directional pressure
+            squeeze = cvd_z > 0   # positive CVD = buying = squeeze risk for shorts
+            return squeeze, False
+        else:
+            # CVD high but price not following — absorption/distribution
+            # don't flag as squeeze; flag as absorption so desk knows context
+            return False, True
+
+    async def _get_float(self, key: str) -> Optional[float]:
         val = await self.rdb.get(key)
-        if val is None:
-            return 0.0
-        return float(val)
-
-    async def is_squeeze_risk(self, symbol: str) -> bool:
-        z = await self.get_cvd_zscore(symbol)
-        return z > CVD_SQUEEZE_THRESHOLD
+        return float(val) if val is not None else None
 
 
 class ArbScreener:
     def __init__(self, cfg: dict):
         self.cfg = cfg
-        self.rdb: aioredis.Redis = None
+        self.rdb: aioredis.Redis     = None
         self.zmq_ctx = zmq.asyncio.Context()
         self.pub: zmq.asyncio.Socket = None
-        self.borrow_fetcher: AaveBorrowRates = None
-        self.funding_fetcher = FundingRateAggregator()
-        self.cvd_monitor: CVDMonitor = None
+        self.borrow_rates: AaveBorrowRates = None
+        self.cvd: CVDDisplacementMonitor   = None
+
+        # shared in-memory funding rate store — WS handlers write, screener reads
+        self._funding_store: dict[str, FundingRate] = {}
 
     async def setup(self):
         self.rdb = aioredis.from_url(f"redis://{self.cfg['redis']['addr']}", decode_responses=True)
@@ -263,50 +306,45 @@ class ArbScreener:
         self.pub.bind(self.cfg["zmq"]["arb_pub"])
 
         w3 = AsyncWeb3(WebSocketProvider(self.cfg["rpc"]["ws_url"]))
-        self.borrow_fetcher = AaveBorrowRates(w3, self.cfg["protocols"]["aave_v3"]["pool"])
-        self.cvd_monitor = CVDMonitor(self.rdb)
+        self.borrow_rates = AaveBorrowRates(w3, self.cfg["protocols"]["aave_v3"]["pool"])
+        self.cvd = CVDDisplacementMonitor(self.rdb)
 
     async def run(self):
         await self.setup()
-        log.info("arb screener running")
+
+        # launch all feed tasks concurrently
+        asyncio.create_task(BinanceFundingWS(self._funding_store).run())
+        asyncio.create_task(BybitFundingWS(self._funding_store).run())
+        asyncio.create_task(HyperliquidFundingPoller(self._funding_store).run())
+
+        # give WS feeds a moment to populate before first scan
+        await asyncio.sleep(3)
+        log.info("arb screener running — funding via WebSocket")
 
         while True:
             await self._scan()
-            await asyncio.sleep(30)  # 30s is fine — rates don't move faster than this
+            await asyncio.sleep(5)  # tighter now — funding data is live, not 30s stale
 
     async def _scan(self):
-        borrow_rates, funding_rates = await asyncio.gather(
-            self.borrow_fetcher.fetch_all(),
-            self.funding_fetcher.fetch_all(),
-        )
-
-        opps = self._find_carries(borrow_rates, funding_rates)
+        borrow = await self.borrow_rates.fetch_all()
+        borrow_map = {r.asset: r for r in borrow}
+        opps = self._find_carries(borrow_map)
         for opp in opps:
             await self._evaluate_and_publish(opp)
 
-    def _find_carries(
-        self,
-        borrow_rates: list[BorrowRate],
-        funding_rates: list[FundingRate],
-    ) -> list[CarryOpportunity]:
-        """
-        Match borrow rates to funding rates by underlying asset.
-        Net spread = funding_apy - borrow_apy - execution_costs (est 0.5%).
-        """
+    def _find_carries(self, borrow_map: dict[str, BorrowRate]) -> list[CarryOpportunity]:
         opps = []
-        borrow_map = {r.asset: r for r in borrow_rates}
+        for key, fr in list(self._funding_store.items()):
+            if time.time() - fr.timestamp > 120:
+                continue  # stale — WS probably dropped
 
-        for fr in funding_rates:
-            base = fr.symbol.replace("USDT", "").replace("PERP", "")
-
-            # map perp symbols to on-chain assets
-            asset_map = {"ETH": "WETH", "BTC": "WBTC", "USDC": "USDC"}
-            asset = asset_map.get(base)
+            base  = fr.symbol.replace("USDT", "").replace("PERP", "")
+            asset = PERP_TO_ASSET.get(base)
             if asset is None or asset not in borrow_map:
                 continue
 
-            br = borrow_map[asset]
-            net_apy = fr.apy - br.apy - Decimal("0.005")  # ~50bps execution cost
+            br      = borrow_map[asset]
+            net_apy = fr.apy - br.apy - EXEC_COST_BPS
 
             if net_apy < MIN_NET_APY:
                 continue
@@ -318,22 +356,22 @@ class ArbScreener:
                 funding_apy=fr.apy,
                 net_apy=net_apy,
                 oi_usd=fr.oi_usd,
-                squeeze_risk=False,  # filled in below
+                squeeze_risk=False,
+                absorption=False,
             ))
-
         return opps
 
     async def _evaluate_and_publish(self, opp: CarryOpportunity):
-        # check CVD before publishing — high positive delta = squeeze risk = skip
-        symbol_map = {"WETH": "ETH", "WBTC": "BTC", "USDC": "USDC"}
-        base = symbol_map.get(opp.long_asset, opp.long_asset)
-        squeeze = await self.cvd_monitor.is_squeeze_risk(f"{base}USDT")
+        asset_to_sym = {"WETH": "ETHUSDT", "WBTC": "BTCUSDT"}
+        sym = asset_to_sym.get(opp.long_asset, opp.long_asset + "USDT")
+
+        squeeze, absorption = await self.cvd.classify(sym)
+        opp.squeeze_risk = squeeze
+        opp.absorption   = absorption
 
         if squeeze:
-            log.info(
-                "skipping carry %s/%s net_apy=%.1f%% — CVD shows squeeze risk",
-                opp.long_asset, opp.short_venue, float(opp.net_apy * 100),
-            )
+            log.info("skipping carry %s/%s — CVD-driven price move, squeeze risk",
+                     opp.long_asset, opp.short_venue)
             return
 
         payload = {
@@ -345,16 +383,22 @@ class ArbScreener:
             "net_apy":     str(opp.net_apy),
             "oi_usd":      str(opp.oi_usd),
             "squeeze_risk": squeeze,
+            "absorption":   absorption,
             "ts":          time.time(),
         }
 
-        log.info(
-            "carry opp: %s/%s net_apy=%.1f%%",
-            opp.long_asset, opp.short_venue, float(opp.net_apy * 100),
-        )
-        await self.pub.send_multipart([b"arb", json.dumps(payload).encode()])
+        level = "INFO"
+        if absorption:
+            # good context for the desk: CVD is hot but price isn't moving
+            # means smart money is selling into retail excitement
+            level = "ABSORPTION"
+            log.info("carry %s/%s net=%.1f%% — ABSORPTION context (distribution likely)",
+                     opp.long_asset, opp.short_venue, float(opp.net_apy * 100))
+        else:
+            log.info("carry %s/%s net=%.1f%%",
+                     opp.long_asset, opp.short_venue, float(opp.net_apy * 100))
 
-        # cache latest opportunities for frontend polling
+        await self.pub.send_multipart([b"arb", json.dumps(payload).encode()])
         await self.rdb.setex(
             f"arb:latest:{opp.long_asset}:{opp.short_venue}",
             300,
@@ -369,8 +413,7 @@ async def main():
     with open("config/config.yaml") as f:
         cfg = yaml.safe_load(f)
 
-    screener = ArbScreener(cfg)
-    await screener.run()
+    await ArbScreener(cfg).run()
 
 
 if __name__ == "__main__":
