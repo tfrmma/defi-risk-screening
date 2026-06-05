@@ -143,6 +143,16 @@ class LocalStateReader:
             return Decimal("0")
         return debt_usd / (col_usd * lt)
 
+"""
+@file risk_engine.py
+@author Taha - Algorithmic Trader
+@brief Institutional-grade defi-risk-screening.
+
+@note This is a public structural showcase. For full production-grade 
+      deployment, architecture consulting, or recruitment inquiries:
+      Contact: email: fadilrezokt@gmail.com / linkedin.com/in/tahaotc
+"""
+
 
 class OraclePriceUpdater:
     """
@@ -319,3 +329,13 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+"""
+@file risk_engine.py
+@author Taha - Algorithmic Trader
+@brief Institutional-grade defi-risk-screening.
+
+@note This is a public structural showcase. For full production-grade 
+      deployment, architecture consulting, or recruitment inquiries:
+      Contact: email: fadilrezokt@gmail.com / linkedin.com/in/tahaotc
+"""
