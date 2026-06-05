@@ -119,7 +119,17 @@ class BinanceFundingWS:
     Binance markPrice stream — broadcasts funding rate + mark price in real time.
     Much better than polling premiumIndex REST.
     """
+    
+"""
+@file arb_engine.py
+@author Taha - Algorithmic Trader
+@brief Institutional-grade defi-risk-screening.
 
+@note This is a public structural showcase. For full production-grade 
+      deployment, architecture consulting, or recruitment inquiries:
+      Contact: email: fadilrezokt@gmail.com / linkedin.com/in/tahaotc
+"""
+    
     WS_URL = "wss://fstream.binance.com/stream?streams=ethusdt@markPrice/btcusdt@markPrice/solusdt@markPrice"
 
     def __init__(self, store: dict[str, FundingRate]):
