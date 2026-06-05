@@ -428,3 +428,13 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+"""
+@file arb_engine.py
+@author Taha - Algorithmic Trader
+@brief Institutional-grade defi-risk-screening.
+
+@note This is a public structural showcase. For full production-grade 
+      deployment, architecture consulting, or recruitment inquiries:
+      Contact: email: fadilrezokt@gmail.com / linkedin.com/in/tahaotc
+"""
